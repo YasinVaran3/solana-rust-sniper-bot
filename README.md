@@ -103,13 +103,4 @@ SL=0.5 #50 percentage
 - Bought: https://solscan.io/tx/3vgim3MwJsdtahXqfW2DrzTAWpVQ8EUTed2cjzHuqxSfUpfp72mgzZhiVosWaCUHdqJTDHpQaYh5xN7rkHGmzqWv
 - Dexscreener: https://dexscreener.com/solana/A1zZXCq2DmqwVD4fLDzmgQ3ceY6LQnMBVokejqnHpump
 
----
-## Donate
 
-👉👌 6vT7nrqtbXDWVc8cRUtifxgfDZi19aW7qhcZg2hSepwb
-
----
-## Support
-
-As the experimental result, the best environment for running this bot is to use `dedicated server located in NY`. 
-For support and further inquiries, please connect via Telegram: 📞 [jwest951227](https://t.me/jwest951227).
