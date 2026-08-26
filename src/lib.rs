@@ -1,3 +1,6 @@
+#![allow(deprecated)]
+
+pub mod context;
 pub mod common;
 pub mod core;
 pub mod dex;

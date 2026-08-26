@@ -1,43 +1,94 @@
-use dotenv::dotenv;
+#![allow(deprecated)]
+
+use anyhow::Result;
+use clap::{Parser, ValueEnum};
 use raydium_pump_snipe_bot::{
     common::{
+        config::AppConfig,
         logger::Logger,
         utils::{
-            create_nonblocking_rpc_client, create_rpc_client, import_env_var, import_wallet,
+            build_http_client, create_nonblocking_rpc_client, create_rpc_client, import_wallet,
             AppState,
         },
     },
-    engine::monitor::{pumpfun_monitor, raydium_monitor},
+    context::AppContext,
+    core::risk::RiskEngine,
+    engine::{arbitrage, monitor, snipe},
     services::jito,
 };
 use solana_sdk::signer::Signer;
-  
+use std::{sync::Arc, time::Instant};
+
+#[derive(Clone, Debug, ValueEnum)]
+enum Mode {
+    Snipe,
+    Arb,
+    All,
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "raydium-pump-snipe-bot", about = "Solana sniper + cross-DEX arbitrage")]
+struct Cli {
+    #[arg(long, value_enum, default_value_t = Mode::All)]
+    mode: Mode,
+}
+
 #[tokio::main]
-async fn main() {  
+async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+    let cli = Cli::parse();
     let logger = Logger::new("[INIT] => ".to_string());
 
-    dotenv().ok();
-    let rpc_wss = import_env_var("RPC_WSS");
-    let rpc_client = create_rpc_client().unwrap();
-    let rpc_nonblocking_client = create_nonblocking_rpc_client().await.unwrap();
-    let wallet = import_wallet().unwrap();
-    let wallet_cloned = wallet.clone();
+    let config = Arc::new(AppConfig::from_env()?);
+    let rpc_client = create_rpc_client()?;
+    let rpc_nonblocking_client = create_nonblocking_rpc_client().await?;
+    let wallet = import_wallet()?;
+    let http = build_http_client(config.http_proxy.as_deref())?;
+
+    if config.use_jito {
+        jito::init_tip_accounts().await?;
+    }
 
     let state = AppState {
         rpc_client,
         rpc_nonblocking_client,
-        wallet,
+        wallet: wallet.clone(),
     };
-    let slippage = import_env_var("SLIPPAGE").parse::<u64>().unwrap_or(5);
-    let use_jito = true;
-    if use_jito {
-        jito::init_tip_accounts().await.unwrap();
-    }
+    let ctx = AppContext {
+        risk: Arc::new(RiskEngine::from_config(&config)),
+        state,
+        config: config.clone(),
+        http,
+        started: Instant::now(),
+    };
 
     logger.log(format!(
-        "Successfully Set the environment variables.\n\t\t\t\t [Web Socket RPC]: {},\n\t\t\t\t [Wallet]: {:?},\n\t\t\t\t [Slippage]: {}\n", 
-        rpc_wss, wallet_cloned.pubkey(), slippage
+        "ready\n\t\t\t\t [mode]: {:?}\n\t\t\t\t [rpc]: {}\n\t\t\t\t [wss]: {}\n\t\t\t\t [wallet]: {}\n\t\t\t\t [dry_run]: {}\n\t\t\t\t [slippage_bps]: {}\n\t\t\t\t [snipe_sol]: {}\n",
+        cli.mode,
+        config.rpc_https,
+        config.rpc_wss,
+        wallet.pubkey(),
+        config.dry_run,
+        config.slippage_bps,
+        config.token_amount_sol
     ));
-    // raydium_monitor(&rpc_wss, state, slippage, use_jito).await;
-    pumpfun_monitor(&rpc_wss, state, slippage, use_jito).await;
+
+    match cli.mode {
+        Mode::Snipe => {
+            tokio::select! {
+                res = monitor::pumpfun_monitor(ctx.clone()) => res,
+                res = monitor::raydium_monitor(ctx.clone()) => res,
+                res = snipe::run(ctx) => res,
+            }
+        }
+        Mode::Arb => arbitrage::run(ctx).await,
+        Mode::All => {
+            tokio::select! {
+                res = monitor::pumpfun_monitor(ctx.clone()) => res,
+                res = monitor::raydium_monitor(ctx.clone()) => res,
+                res = snipe::run(ctx.clone()) => res,
+                res = arbitrage::run(ctx) => res,
+            }
+        }
+    }
 }

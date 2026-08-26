@@ -8,7 +8,6 @@ pub struct Logger {
 }
 
 impl Logger {
-    // Constructor function to create a new Logger instance
     pub fn new(prefix: String) -> Self {
         Logger {
             prefix,
@@ -16,46 +15,42 @@ impl Logger {
         }
     }
 
-    // Method to log a message with a prefix
     pub fn log(&self, message: String) -> String {
         let log = format!("{} {}", self.prefix_with_date(), message);
-        println!("{}", log);
+        println!("{log}");
         log
     }
 
     pub fn debug(&self, message: String) -> String {
         let log = format!("{} [{}] {}", self.prefix_with_date(), "DEBUG", message);
         if LogLevel::new().is_debug() {
-            println!("{}", log);
+            println!("{log}");
         }
         log
     }
+
     pub fn error(&self, message: String) -> String {
         let log = format!("{} [{}] {}", self.prefix_with_date(), "ERROR", message);
-        println!("{}", log);
-
+        println!("{log}");
         log
     }
 
     fn prefix_with_date(&self) -> String {
         let date = Local::now();
-        format!(
-            "[{}] {}",
-            date.format(self.date_format.as_str()),
-            self.prefix
-        )
+        format!("[{}] {}", date.format(self.date_format.as_str()), self.prefix)
     }
 }
 
 struct LogLevel<'a> {
     level: &'a str,
 }
+
 impl LogLevel<'_> {
     fn new() -> Self {
-        let level = LOG_LEVEL;
-        LogLevel { level }
+        LogLevel { level: LOG_LEVEL }
     }
+
     fn is_debug(&self) -> bool {
-        self.level.to_lowercase().eq("debug")
+        self.level.eq_ignore_ascii_case("debug")
     }
 }

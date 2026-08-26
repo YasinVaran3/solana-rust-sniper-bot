@@ -1,123 +1,207 @@
-use std::{env, sync::Arc, time::Duration};
-
-use anyhow::Result;
-use jito_json_rpc_client::jsonrpc_client::rpc_client::RpcClient as JitoRpcClient;
-use solana_client::rpc_client::RpcClient;
+use anyhow::{anyhow, Result};
 use solana_sdk::{
-    instruction::Instruction,
+    hash::Hash,
+    instruction::{AccountMeta, Instruction},
+    message::{v0, VersionedMessage},
+    pubkey::Pubkey,
     signature::Keypair,
     signer::Signer,
-    system_transaction,
     transaction::{Transaction, VersionedTransaction},
 };
-use spl_token::ui_amount_to_amount;
-
-use std::str::FromStr;
+use std::time::Duration;
 use tokio::time::Instant;
 
-use crate::{
-    common::logger::Logger,
-    services::jito::{self, get_tip_account, get_tip_value, wait_for_bundle_confirmation},
-};
+use crate::common::constants::compute_budget;
+use crate::common::logger::Logger;
+use crate::services::jito;
 
-// prioritization fee = UNIT_PRICE * UNIT_LIMIT
-fn get_unit_price() -> u64 {
-    env::var("UNIT_PRICE")
-        .ok()
-        .and_then(|v| u64::from_str(&v).ok())
-        .unwrap_or(1)
+pub fn set_compute_unit_limit(units: u32) -> Instruction {
+    let mut data = vec![2u8];
+    data.extend_from_slice(&units.to_le_bytes());
+    Instruction {
+        program_id: compute_budget(),
+        accounts: vec![],
+        data,
+    }
 }
 
-fn get_unit_limit() -> u32 {
-    env::var("UNIT_LIMIT")
-        .ok()
-        .and_then(|v| u32::from_str(&v).ok())
-        .unwrap_or(300_000)
+pub fn set_compute_unit_price(micro_lamports: u64) -> Instruction {
+    let mut data = vec![3u8];
+    data.extend_from_slice(&micro_lamports.to_le_bytes());
+    Instruction {
+        program_id: compute_budget(),
+        accounts: vec![],
+        data,
+    }
+}
+
+pub fn prepend_budget(mut instructions: Vec<Instruction>, unit_price: u64, unit_limit: u32) -> Vec<Instruction> {
+    let mut prefix = vec![
+        set_compute_unit_price(unit_price),
+        set_compute_unit_limit(unit_limit),
+    ];
+    prefix.append(&mut instructions);
+    prefix
+}
+
+pub fn compile_legacy(
+    payer: &Keypair,
+    instructions: &[Instruction],
+    blockhash: Hash,
+) -> Result<Transaction> {
+    Ok(Transaction::new_signed_with_payer(
+        instructions,
+        Some(&payer.pubkey()),
+        &[payer],
+        blockhash,
+    ))
+}
+
+pub fn compile_v0(
+    payer: &Keypair,
+    instructions: &[Instruction],
+    blockhash: Hash,
+    alts: &[solana_sdk::message::AddressLookupTableAccount],
+) -> Result<VersionedTransaction> {
+    let msg = v0::Message::try_compile(&payer.pubkey(), instructions, alts, blockhash)?;
+    Ok(VersionedTransaction::try_new(
+        VersionedMessage::V0(msg),
+        &[payer],
+    )?)
 }
 
 pub async fn new_signed_and_send(
-    client: &RpcClient,
+    client: &solana_client::rpc_client::RpcClient,
     keypair: &Keypair,
     mut instructions: Vec<Instruction>,
     use_jito: bool,
+    unit_price: u64,
+    unit_limit: u32,
+    tip_sol: f64,
+    block_engine_url: &str,
+    dry_run: bool,
     logger: &Logger,
 ) -> Result<Vec<String>> {
-    let unit_price = get_unit_price();
-    let unit_limit = get_unit_limit();
-    // If not using Jito, manually set the compute unit price and limit
     if !use_jito {
-        let modify_compute_units =
-            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(
-                unit_price,
-            );
-        let add_priority_fee =
-            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
-                unit_limit,
-            );
-        instructions.insert(0, modify_compute_units);
-        instructions.insert(1, add_priority_fee);
+        instructions = prepend_budget(instructions, unit_price, unit_limit);
+    } else {
+        instructions.insert(0, set_compute_unit_limit(unit_limit));
     }
-    // send init tx
+
     let recent_blockhash = client.get_latest_blockhash()?;
-    let txn = Transaction::new_signed_with_payer(
-        &instructions,
-        Some(&keypair.pubkey()),
-        &vec![keypair],
-        recent_blockhash,
-    );
+    let txn = compile_legacy(keypair, &instructions, recent_blockhash)?;
+
+    if dry_run {
+        logger.log(format!(
+            "DRY_RUN: compiled {} instruction(s), skip broadcast",
+            txn.message.instructions.len()
+        ));
+        return Ok(vec!["dry-run".to_string()]);
+    }
 
     let start_time = Instant::now();
-    let mut txs = vec![];
-    if use_jito {
-        // jito
-        let tip_account = get_tip_account().await?;
-        let jito_client = Arc::new(JitoRpcClient::new(format!(
-            "{}/api/v1/bundles",
-            *jito::BLOCK_ENGINE_URL
-        )));
-        // jito tip, the upper limit is 0.1
-        let mut tip = get_tip_value().await?;
-        tip = tip.min(0.1);
-        let tip_lamports = ui_amount_to_amount(tip, spl_token::native_mint::DECIMALS);
+    let txs = if use_jito {
+        let tip_account = jito::get_tip_account().await?;
+        let tip_lamports = jito::tip_lamports(tip_sol);
         logger.log(format!(
-            "tip account: {}, tip(sol): {}, lamports: {}",
-            tip_account, tip, tip_lamports
+            "jito tip account: {tip_account}, tip sol: {tip_sol}, lamports: {tip_lamports}"
         ));
-        // tip tx
-        let bundle: Vec<VersionedTransaction> = vec![
-            VersionedTransaction::from(txn),
-            VersionedTransaction::from(system_transaction::transfer(
-                keypair,
-                &tip_account,
-                tip_lamports,
-                recent_blockhash,
-            )),
-        ];
-        let bundle_id = jito_client.send_bundle(&bundle).await?;
-        logger.log(format!("bundle_id: {}", bundle_id));
-
-        txs = wait_for_bundle_confirmation(
-            move |id: String| {
-                let client = Arc::clone(&jito_client);
-                async move {
-                    let response = client.get_bundle_statuses(&[id]).await;
-                    let statuses = response.inspect_err(|err| {
-                        logger.log(format!("Error fetching bundle status: {:?}", err));
-                    })?;
-                    Ok(statuses.value)
-                }
-            },
-            bundle_id,
-            Duration::from_millis(1000),
-            Duration::from_secs(10),
+        let tip_ix = solana_sdk::system_instruction::transfer(
+            &keypair.pubkey(),
+            &tip_account,
+            tip_lamports,
+        );
+        let mut with_tip = txn.message.instructions.clone();
+        let mut ixs = instructions;
+        ixs.push(tip_ix);
+        let bundle_txn = compile_legacy(keypair, &ixs, recent_blockhash)?;
+        let _ = with_tip;
+        let bundle_id = jito::send_bundle(block_engine_url, &[bundle_txn]).await?;
+        logger.log(format!("bundle_id: {bundle_id}"));
+        jito::wait_for_bundle_confirmation(
+            block_engine_url,
+            &bundle_id,
+            Duration::from_millis(800),
+            Duration::from_secs(12),
+            logger,
         )
-        .await?;
+        .await?
     } else {
-        let sig = common::rpc::send_txn(client, &txn, true)?;
-        logger.log(format!("signature: {:#?}", sig));
-        txs.push(sig.to_string());
-    }
+        let sig = client.send_and_confirm_transaction(&txn)?;
+        logger.log(format!("signature: {sig}"));
+        vec![sig.to_string()]
+    };
 
-    logger.log(format!("tx ellapsed: {:?}", start_time.elapsed()));
+    logger.log(format!("tx elapsed: {:?}", start_time.elapsed()));
     Ok(txs)
+}
+
+pub async fn send_versioned(
+    client: &solana_client::rpc_client::RpcClient,
+    tx: VersionedTransaction,
+    use_jito: bool,
+    block_engine_url: &str,
+    dry_run: bool,
+    logger: &Logger,
+) -> Result<Vec<String>> {
+    if dry_run {
+        logger.log("DRY_RUN: skip versioned broadcast".into());
+        return Ok(vec!["dry-run".to_string()]);
+    }
+    if use_jito {
+        let bundle_id = jito::send_versioned_bundle(block_engine_url, &[tx]).await?;
+        logger.log(format!("bundle_id: {bundle_id}"));
+        jito::wait_for_bundle_confirmation(
+            block_engine_url,
+            &bundle_id,
+            Duration::from_millis(800),
+            Duration::from_secs(12),
+            logger,
+        )
+        .await
+    } else {
+        let sig = client.send_transaction(&tx)?;
+        logger.log(format!("signature: {sig}"));
+        Ok(vec![sig.to_string()])
+    }
+}
+
+pub fn ix_from_json(
+    program_id: &str,
+    accounts: &[serde_json::Value],
+    data_b64: &str,
+) -> Result<Instruction> {
+    let program_id: Pubkey = program_id.parse()?;
+    let mut metas = Vec::new();
+    for acc in accounts {
+        let pubkey: Pubkey = acc
+            .get("pubkey")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing pubkey"))?
+            .parse()?;
+        let is_signer = acc
+            .get("isSigner")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let is_writable = acc
+            .get("isWritable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        metas.push(if is_writable {
+            if is_signer {
+                AccountMeta::new(pubkey, true)
+            } else {
+                AccountMeta::new(pubkey, false)
+            }
+        } else {
+            AccountMeta::new_readonly(pubkey, is_signer)
+        });
+    }
+    let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64)
+        .map_err(|e| anyhow!("invalid instruction data: {e}"))?;
+    Ok(Instruction {
+        program_id,
+        accounts: metas,
+        data,
+    })
 }

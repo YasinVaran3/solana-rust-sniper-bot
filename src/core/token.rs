@@ -1,88 +1,70 @@
-use solana_sdk::{pubkey::Pubkey, signature::Keypair};
-use spl_token_2022::{
-    extension::StateWithExtensionsOwned,
-    state::{Account, Mint},
-};
-use spl_token_client::{
-    client::{ProgramClient, ProgramRpcClient, ProgramRpcClientSendTransaction},
-    token::{Token, TokenError, TokenResult},
-};
-use std::sync::Arc;
+use anyhow::{anyhow, Result};
+use solana_program::program_pack::Pack;
+use solana_sdk::pubkey::Pubkey;
+use spl_associated_token_account::get_associated_token_address;
+use spl_token::state::{Account as TokenAccount, Mint};
 
-pub fn get_associated_token_address(
-    client: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
-    keypair: Arc<Keypair>,
-    address: &Pubkey,
-    owner: &Pubkey,
-) -> Pubkey {
-    let token_client = Token::new(
-        Arc::new(ProgramRpcClient::new(
-            client.clone(),
-            ProgramRpcClientSendTransaction,
-        )),
-        &spl_token::ID,
-        address,
-        None,
-        Arc::new(Keypair::from_bytes(&keypair.to_bytes()).expect("failed to copy keypair")),
-    );
-    token_client.get_associated_token_address(owner)
+pub fn ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    get_associated_token_address(owner, mint)
+}
+
+pub async fn account_exists(
+    client: &solana_client::nonblocking::rpc_client::RpcClient,
+    pubkey: &Pubkey,
+) -> Result<bool> {
+    Ok(client.get_account(pubkey).await.is_ok())
+}
+
+pub async fn token_balance(
+    client: &solana_client::nonblocking::rpc_client::RpcClient,
+    ata: &Pubkey,
+) -> Result<u64> {
+    let account = client
+        .get_account(ata)
+        .await
+        .map_err(|e| anyhow!("token account {ata} not found: {e}"))?;
+    let parsed = TokenAccount::unpack(&account.data)
+        .map_err(|e| anyhow!("failed to unpack token account: {e}"))?;
+    Ok(parsed.amount)
+}
+
+pub async fn mint_info(
+    client: &solana_client::nonblocking::rpc_client::RpcClient,
+    mint: &Pubkey,
+) -> Result<Mint> {
+    let account = client
+        .get_account(mint)
+        .await
+        .map_err(|e| anyhow!("mint {mint} not found: {e}"))?;
+    Mint::unpack(&account.data).map_err(|e| anyhow!("failed to unpack mint: {e}"))
+}
+
+pub fn mint_authorities_revoked(mint: &Mint) -> bool {
+    mint.mint_authority.is_none() && mint.freeze_authority.is_none()
 }
 
 pub async fn get_account_info(
-    client: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
-    _keypair: Arc<Keypair>,
-    address: &Pubkey,
+    client: std::sync::Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    _keypair: std::sync::Arc<solana_sdk::signature::Keypair>,
+    mint: &Pubkey,
     account: &Pubkey,
-) -> TokenResult<StateWithExtensionsOwned<Account>> {
-    let program_client = Arc::new(ProgramRpcClient::new(
-        client.clone(),
-        ProgramRpcClientSendTransaction,
-    ));
-    let account = program_client
-        .get_account(*account)
+) -> Result<TokenAccount> {
+    let acc = client
+        .get_account(account)
         .await
-        .map_err(TokenError::Client)?
-        .ok_or(TokenError::AccountNotFound)
-        .inspect_err(|err| println!("get_account_info: {} {}: mint {}", account, err, address))?;
-
-    if account.owner != spl_token::ID {
-        return Err(TokenError::AccountInvalidOwner);
+        .map_err(|e| anyhow!("account {account} not found: {e}"))?;
+    let parsed = TokenAccount::unpack(&acc.data)
+        .map_err(|e| anyhow!("failed to unpack token account: {e}"))?;
+    if parsed.mint != *mint {
+        return Err(anyhow!("account mint mismatch"));
     }
-    let account = StateWithExtensionsOwned::<Account>::unpack(account.data)?;
-    if account.base.mint != *address {
-        return Err(TokenError::AccountInvalidMint);
-    }
-
-    Ok(account)
+    Ok(parsed)
 }
 
 pub async fn get_mint_info(
-    client: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
-    _keypair: Arc<Keypair>,
+    client: std::sync::Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    _keypair: std::sync::Arc<solana_sdk::signature::Keypair>,
     address: &Pubkey,
-) -> TokenResult<StateWithExtensionsOwned<Mint>> {
-    let program_client = Arc::new(ProgramRpcClient::new(
-        client.clone(),
-        ProgramRpcClientSendTransaction,
-    ));
-    let account = program_client
-        .get_account(*address)
-        .await
-        .map_err(TokenError::Client)?
-        .ok_or(TokenError::AccountNotFound)
-        .inspect_err(|err| println!("{} {}: mint {}", address, err, address))?;
-
-    if account.owner != spl_token::ID {
-        return Err(TokenError::AccountInvalidOwner);
-    }
-
-    let mint_result = StateWithExtensionsOwned::<Mint>::unpack(account.data).map_err(Into::into);
-    let decimals: Option<u8> = None;
-    if let (Ok(mint), Some(decimals)) = (&mint_result, decimals) {
-        if decimals != mint.base.decimals {
-            return Err(TokenError::InvalidDecimals);
-        }
-    }
-
-    mint_result
+) -> Result<Mint> {
+    mint_info(client.as_ref(), address).await
 }
